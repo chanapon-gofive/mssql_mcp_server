@@ -58,6 +58,39 @@ login lacks the `SHOWPLAN` permission — it aborts instead of executing the sta
 
 `explain_query` requires the **`SHOWPLAN`** permission on the database (`GRANT SHOWPLAN TO [<user>]`).
 
+### `export_module`
+
+Writes the exact text of a procedure / function / view / trigger (`sys.sql_modules.definition`) to a
+`.sql` file **on the server side**, so the definition never travels through the reply — useful for
+modules far too large to page through `execute_sql` (hundreds of thousands of characters).
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `object_name` | — | Name as `OBJECT_ID()` takes it, e.g. `dbo.MyProc` |
+| `path` | — | Target `.sql` file inside the export root; a relative path is taken from the root |
+| `overwrite` | `false` | Replace the file if it already exists (refused otherwise, so an edited copy is not clobbered) |
+
+The file is UTF-8 without a BOM, written with `newline=''`: CRLF/LF and trailing whitespace are kept
+as stored, nothing is truncated. Before writing, the SHA2_256 of the UTF-16LE text is checked against
+`HASHBYTES('SHA2_256', definition)` computed on the server, and the file is read back and checked
+again. The reply carries only the path, the length in characters (`DATALENGTH(definition)/2`), the
+line count with CRLF/LF counts, and that hash.
+
+### `compare_module`
+
+Checks whether a `.sql` file equals a module's current definition — e.g. "has this script been run
+yet?", or DEV vs UAT by calling it on both servers. A file run as a single batch (no `GO`) is stored
+verbatim, header comments included, so after it runs the two match exactly.
+
+On a mismatch it reports the first differing line (length and first 8 hex chars of the line hash on
+each side — comparable with `STRING_SPLIT(definition, CHAR(10), 1)` — plus the kind of difference and a
+short excerpt around it), whether the two are identical apart from trailing whitespace and line
+endings, and the changed line ranges. UTF-8, UTF-8 with BOM and UTF-16 files are accepted.
+
+Both tools only accept paths inside the export root (`MSSQL_EXPORT_ROOT`); anything else — including
+`..` and symlinks that lead out of it — is refused before connecting. They run one fixed `SELECT`
+and roll back like every other tool.
+
 ## Installation
 
 ```bash
@@ -94,6 +127,7 @@ Optional flags:
 | `MSSQL_EXPLAIN_ALLOW_ACTUAL_EXEC` | `false` | Allow `EXEC`/DML in `mode='actual'`, which really runs the statement before rolling back |
 | `MSSQL_PLAN_DIR` | `<tmp>/mssql_mcp_plans` | Where `.sqlplan` files are written |
 | `MSSQL_PLAN_INLINE_CHARS` | `200000` | Cap on inlined plan XML when `include_xml: true` |
+| `MSSQL_EXPORT_ROOT` | `~/work/.claude/plans/sql` | The only directory `export_module` / `compare_module` may write or read |
 | `MSSQL_ODBC_POOLING` | `true` | Set to `false` to disable ODBC connection pooling (slower, but removes any chance of a `SET` option surviving into the next call) |
 
 ## Usage

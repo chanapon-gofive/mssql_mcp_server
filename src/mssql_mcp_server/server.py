@@ -1,4 +1,8 @@
 import asyncio
+import codecs
+import contextlib
+import difflib
+import hashlib
 import json
 import logging
 import os
@@ -545,6 +549,256 @@ async def _explain_query(arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text="\n".join(out))]
 
 
+# ---- Module export / compare (sys.sql_modules ↔ .sql file) -----------------
+
+# คำสั่งคงที่ ชื่อ object ส่งเป็น parameter; hash/length คำนวณที่ server ไว้ยืนยันว่าข้อความที่ได้มาไม่เพี้ยน
+_MODULE_SQL = (
+    "SELECT OBJECT_SCHEMA_NAME(m.object_id) + N'.' + OBJECT_NAME(m.object_id), o.type_desc, "
+    "m.definition, DATALENGTH(m.definition) / 2, "
+    "CONVERT(VARCHAR(64), HASHBYTES('SHA2_256', m.definition), 2) "
+    "FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id "
+    "WHERE m.object_id = OBJECT_ID(?)"
+)
+
+
+def _export_root() -> Path:
+    return Path(os.getenv("MSSQL_EXPORT_ROOT") or "~/work/.claude/plans/sql").expanduser().resolve()
+
+
+def _resolve_sql_path(path: str) -> Path:
+    """path สัมพัทธ์ต่อจาก export root; resolve() ก่อนเช็กเพื่อกัน .. และ symlink ที่ชี้ออกนอก root"""
+    if not path or not str(path).strip():
+        raise ValueError("path is required")
+    root = _export_root()
+    p = Path(str(path).strip()).expanduser()
+    p = (p if p.is_absolute() else root / p).resolve()
+    if p == root or not p.is_relative_to(root):
+        raise PermissionError(f"path must be a file inside {root}")
+    if p.suffix.lower() != ".sql":
+        raise PermissionError("path must end with .sql")
+    if p.is_dir():
+        raise PermissionError(f"path is a directory: {p}")
+    return p
+
+
+def _text_stats(text: str) -> dict:
+    """chars = UTF-16 code units (= DATALENGTH/2); sha256 ของ UTF-16LE ตรงกับ HASHBYTES('SHA2_256', nvarchar)"""
+    data = text.encode("utf-16-le", "surrogatepass")
+    lf_total = text.count("\n")
+    crlf = text.count("\r\n")
+    return {
+        "chars": len(data) // 2,
+        "lines": lf_total + (0 if not text or text.endswith("\n") else 1),
+        "crlf": crlf,
+        "lf": lf_total - crlf,
+        "sha256": hashlib.sha256(data).hexdigest().upper(),
+    }
+
+
+def _fmt_stats(st: dict) -> str:
+    return (f"{st['chars']:,} chars · {st['lines']:,} lines (CRLF {st['crlf']:,} · LF {st['lf']:,}) · "
+            f"sha256 {st['sha256']}")
+
+
+def _fetch_module(object_name: str) -> tuple[dict, dict]:
+    conn, s = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(_MODULE_SQL, object_name)
+        row = cur.fetchone()
+    finally:
+        # rollback เสมอเหมือน tool อื่น — server นี้ไม่ commit อะไรทั้งสิ้น
+        conn.rollback()
+        conn.close()
+    if row is None:
+        raise LookupError(f"No module named {object_name!r} in {s['database']} (not found, or no VIEW DEFINITION)")
+    name, type_desc, definition, db_chars, db_hash = row
+    if definition is None:
+        raise LookupError(f"{name} has no readable definition (WITH ENCRYPTION?)")
+    st = _text_stats(definition)
+    if st["chars"] != int(db_chars) or st["sha256"] != (db_hash or "").upper():
+        raise RuntimeError(
+            f"Fetched text of {name} does not match the server (local {st['chars']:,} chars {st['sha256']}, "
+            f"server {int(db_chars):,} chars {db_hash})"
+        )
+    return {"name": name, "type": type_desc, "definition": definition, "stats": st}, s
+
+
+def _write_exact(p: Path, text: str) -> None:
+    """เขียน UTF-8 ไม่มี BOM, newline='' คง CRLF/LF; ผ่าน temp file + os.replace กันไฟล์ครึ่ง ๆ"""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, p)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
+def _read_sql_text(p: Path) -> tuple[str, str]:
+    """decode เองจาก bytes (ไม่แปลง newline); BOM ไม่ใช่ส่วนของ batch ที่ server เก็บจึงตัดทิ้ง"""
+    raw = p.read_bytes()
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16"), "utf-16 (BOM)"
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw[len(codecs.BOM_UTF8):].decode("utf-8"), "utf-8 (BOM)"
+    return raw.decode("utf-8"), "utf-8"
+
+
+def _line_hash(line: str) -> str:
+    return hashlib.sha256(line.encode("utf-16-le", "surrogatepass")).hexdigest().upper()[:8]
+
+
+def _normalize_ws(text: str) -> list[str]:
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def _describe_line_diff(n: int, db_line: str | None, file_line: str | None) -> list[str]:
+    def side(label, ln):
+        if ln is None:
+            return f"   {label}: (no line {n})"
+        return f"   {label}: len {len(ln):,}, h {_line_hash(ln)}"
+
+    if db_line is None or file_line is None:
+        kind = "file has extra lines" if db_line is None else "file ends early"
+        return [f"first difference: line {n:,} — {kind}", side("DB  ", db_line), side("file", file_line)]
+
+    col = next((i for i, (a, b) in enumerate(zip(db_line, file_line)) if a != b), min(len(db_line), len(file_line)))
+    if db_line.rstrip("\r") == file_line.rstrip("\r"):
+        kind = "line ending only"
+    elif db_line.rstrip() == file_line.rstrip():
+        kind = "trailing whitespace only"
+    else:
+        kind = f"content, from column {col + 1}"
+    # ส่งแค่ช่วงสั้น ๆ รอบจุดต่าง ไม่ส่งทั้งบรรทัด
+    lo = max(0, col - 30)
+    return [
+        f"first difference: line {n:,} — {kind}",
+        side("DB  ", db_line) + f", near {db_line[lo:col + 30]!r}",
+        side("file", file_line) + f", near {file_line[lo:col + 30]!r}",
+    ]
+
+
+def _compare_texts(db_text: str, file_text: str) -> list[str]:
+    db_lines, file_lines = db_text.split("\n"), file_text.split("\n")
+    first = next((i for i, (a, b) in enumerate(zip(db_lines, file_lines)) if a != b), None)
+    if first is None:
+        first = min(len(db_lines), len(file_lines))
+    out = _describe_line_diff(
+        first + 1,
+        db_lines[first] if first < len(db_lines) else None,
+        file_lines[first] if first < len(file_lines) else None,
+    )
+
+    if _normalize_ws(db_text) == _normalize_ws(file_text):
+        out.insert(0, "verdict: DIFFERENT — whitespace only (identical after trimming trailing "
+                      "whitespace, line endings and trailing blank lines)")
+        return out
+
+    def span(a, b):
+        return f"{a + 1}-{b}" if b - a > 1 else str(b) if b > a else f"(before {a + 1})"
+
+    out.insert(0, "verdict: DIFFERENT — content differs")
+    ops = [o for o in difflib.SequenceMatcher(None, db_lines, file_lines).get_opcodes() if o[0] != "equal"]
+    spans = [f"{tag} DB {span(i1, i2)} ↔ file {span(j1, j2)}" for tag, i1, i2, j1, j2 in ops[:5]]
+    out.append(f"hunks: {len(ops):,}" + (f" — {'; '.join(spans)}" if spans else "")
+               + (" …" if len(ops) > 5 else ""))
+    return out
+
+
+def _module_args(arguments: dict) -> tuple[str, str]:
+    object_name = (arguments.get("object_name") or "").strip()
+    if not object_name:
+        raise ValueError("object_name is required")
+    if len(object_name) > 300:
+        raise ValueError("object_name is too long")
+    path = arguments.get("path")
+    if not path:
+        raise ValueError("path is required")
+    return object_name, path
+
+
+async def _export_module(arguments: dict) -> list[TextContent]:
+    object_name, path = _module_args(arguments)
+    try:
+        p = _resolve_sql_path(path)
+    except PermissionError as e:
+        logger.warning(f"Blocked export_module path: {e}")
+        return [TextContent(type="text", text=f"Blocked: {e}")]
+    if p.exists() and not arguments.get("overwrite"):
+        return [TextContent(type="text", text=(
+            f"Blocked: {p} already exists — pass overwrite=true to replace it "
+            f"(compare_module shows whether it differs from the database first)."
+        ))]
+
+    try:
+        mod, s = _fetch_module(object_name)
+        _write_exact(p, mod["definition"])
+        back = _text_stats(_read_sql_text(p)[0])
+    except (LookupError, RuntimeError) as e:
+        return [TextContent(type="text", text=f"Error: {e} — nothing written")]
+    except Exception as e:
+        logger.error(f"export_module failed: {e}")
+        return [TextContent(type="text", text=f"Error exporting module: {e}")]
+
+    st = mod["stats"]
+    if back != st:
+        return [TextContent(type="text", text=f"Error: {p} was written but does not read back identical "
+                                              f"({_fmt_stats(back)}) — do not use it")]
+    logger.info(f"export_module {mod['name']} → {p} ({st['chars']} chars)")
+    return [TextContent(type="text", text="\n".join([
+        f"Exported {mod['name']} ({mod['type']}) from {s['server']}/{s['database']}",
+        f"path:   {p}",
+        f"chars:  {st['chars']:,} (= DATALENGTH(definition)/2)",
+        f"lines:  {st['lines']:,} (CRLF {st['crlf']:,} · LF {st['lf']:,})",
+        f"sha256: {st['sha256']} (UTF-16LE) — matches HASHBYTES('SHA2_256', definition) on the server "
+        f"and the file read back",
+        f"file:   utf-8 without BOM, {p.stat().st_size:,} bytes",
+    ]))]
+
+
+async def _compare_module(arguments: dict) -> list[TextContent]:
+    object_name, path = _module_args(arguments)
+    try:
+        p = _resolve_sql_path(path)
+    except PermissionError as e:
+        logger.warning(f"Blocked compare_module path: {e}")
+        return [TextContent(type="text", text=f"Blocked: {e}")]
+    if not p.is_file():
+        return [TextContent(type="text", text=f"Error: file not found: {p}")]
+    try:
+        file_text, enc = _read_sql_text(p)
+    except UnicodeDecodeError as e:
+        return [TextContent(type="text", text=f"Error: {p} is not UTF-8/UTF-16 text ({e})")]
+
+    try:
+        mod, s = _fetch_module(object_name)
+    except (LookupError, RuntimeError) as e:
+        return [TextContent(type="text", text=f"Error: {e}")]
+    except Exception as e:
+        logger.error(f"compare_module failed: {e}")
+        return [TextContent(type="text", text=f"Error reading module: {e}")]
+
+    db_st, file_st = mod["stats"], _text_stats(file_text)
+    out = [
+        f"compare {mod['name']} ({mod['type']}) — {s['server']}/{s['database']} ↔ {p}",
+        f"DB  : {_fmt_stats(db_st)}",
+        f"file: {_fmt_stats(file_st)} · {enc}",
+    ]
+    if db_st["sha256"] == file_st["sha256"]:
+        out.append("verdict: MATCH — the database definition equals the file exactly")
+    else:
+        out.extend(_compare_texts(mod["definition"], file_text))
+    return [TextContent(type="text", text="\n".join(out))]
+
+
 # Initialize server
 app = Server("mssql_mcp_server")
 
@@ -664,6 +918,63 @@ async def list_tools() -> list[Tool]:
                 "required": ["query"],
             },
         ),
+        Tool(
+            name="export_module",
+            description=(
+                "Write the exact definition of a stored procedure / function / view / trigger "
+                "(sys.sql_modules.definition) to a .sql file on disk, server-side, with no size limit. "
+                "Line endings and trailing whitespace are kept byte-for-byte (UTF-8, no BOM). "
+                "The definition never comes back in the reply — only the path, length in chars "
+                "(= DATALENGTH/2), line count and the SHA2_256 of the UTF-16LE text, verified against "
+                "HASHBYTES('SHA2_256', definition) on the server. The path must be inside the export "
+                "root (MSSQL_EXPORT_ROOT, default ~/work/.claude/plans/sql); a relative path is taken "
+                "from that root. Read-only: one SELECT, always rolled back."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "object_name": {
+                        "type": "string",
+                        "description": "Module name as OBJECT_ID() takes it, e.g. dbo.MyProc or [emconnect].[MyFn]",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Target .sql file inside the export root, absolute or relative to it",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Replace the file if it already exists",
+                    },
+                },
+                "required": ["object_name", "path"],
+            },
+        ),
+        Tool(
+            name="compare_module",
+            description=(
+                "Check whether a .sql file equals the current definition of a module in this database "
+                "(e.g. 'has the user run the script yet?', or DEV vs UAT by calling it on both servers). "
+                "Compares the SHA2_256 of the UTF-16LE text; on a mismatch reports the first differing "
+                "line (length and short hash per side, kind of difference, a short excerpt around it), "
+                "whether the two are identical apart from trailing whitespace / line endings, and the "
+                "changed line ranges. The path must be inside the export root. Read-only."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "object_name": {
+                        "type": "string",
+                        "description": "Module name as OBJECT_ID() takes it, e.g. dbo.MyProc",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": ".sql file inside the export root, absolute or relative to it",
+                    },
+                },
+                "required": ["object_name", "path"],
+            },
+        ),
     ]
 
 
@@ -673,6 +984,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     logger.info(f"Calling tool: {name}")
     if name == "explain_query":
         return await _explain_query(arguments)
+    if name == "export_module":
+        return await _export_module(arguments)
+    if name == "compare_module":
+        return await _compare_module(arguments)
     if name != "execute_sql":
         raise ValueError(f"Unknown tool: {name}")
 
