@@ -6,15 +6,90 @@ MSSQL MCP Server is a **Model Context Protocol (MCP) server** that enables secur
 - List available tables
 - Read table contents
 - Execute SQL queries with controlled access
+- Capture execution plans (SHOWPLAN / STATISTICS) for query tuning
 
 This ensures safer database exploration, strict permission enforcement, and logging of database interactions.
 
 ## Features
 
 - **Secure MSSQL Database Access** through environment variables
+- **Read-only by default** — non-`SELECT`/`WITH` statements are rejected and every connection is rolled back
 - **Controlled Query Execution** with error handling
 - **Table Listing & Data Retrieval**
+- **Execution plan capture** with a readable summary (`explain_query`)
 - **Comprehensive Logging** for monitoring queries and operations
+
+## Tools
+
+### `execute_sql`
+
+Runs a read-only query. Only `SELECT` / `WITH` (and `SHOW TABLES`) are accepted; stacked statements
+and `SELECT ... INTO` are rejected, and the connection is always rolled back — the server never commits.
+
+### `explain_query`
+
+Captures a SQL Server execution plan and returns a readable summary plus the path to the full
+`.sqlplan` file (openable in SSMS or any plan viewer).
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `query` | — | The statement to explain |
+| `mode` | `estimated` | `estimated` = `SET SHOWPLAN_XML` (compile only, nothing runs); `actual` = `SET STATISTICS XML` + `IO` + `TIME` (really runs, then rolls back) |
+| `include_xml` | `false` | Also inline the raw plan XML (usually large — the saved file is enough) |
+| `max_rows` | `0` | `mode='actual'`: how many result rows to echo back |
+
+The summary contains, per statement: subtree cost, compile time, memory grant, missing-index
+suggestions, optimizer warnings (implicit conversions, tempdb spills, missing statistics), and the top
+operators by *own* cost — flagged with `‼ scan` for full scans and, in `actual` mode, `‼ estimate skew`
+where actual rows diverge from the estimate by more than 10×. `actual` mode also reports
+`STATISTICS TIME` and per-table `STATISTICS IO` logical reads.
+
+**What each mode accepts**
+
+| | `estimated` | `actual` |
+|---|---|---|
+| `SELECT` / `WITH` | ✅ | ✅ |
+| `EXEC` / `INSERT` / `UPDATE` / `DELETE` / `MERGE` | ✅ — SHOWPLAN compiles without executing | ❌ unless `MSSQL_EXPLAIN_ALLOW_ACTUAL_EXEC=true` |
+| DDL, `DBCC`, `BACKUP`, `USE`, stacked statements | ❌ | ❌ |
+
+Before running anything in `estimated` mode the server sends a canary (`SELECT 1`) and verifies the
+server answered with plan XML rather than a value. If `SET SHOWPLAN_XML ON` did not engage — e.g. the
+login lacks the `SHOWPLAN` permission — it aborts instead of executing the statement for real.
+
+`explain_query` requires the **`SHOWPLAN`** permission on the database (`GRANT SHOWPLAN TO [<user>]`).
+
+### `export_module`
+
+Writes the exact text of a procedure / function / view / trigger (`sys.sql_modules.definition`) to a
+`.sql` file **on the server side**, so the definition never travels through the reply — useful for
+modules far too large to page through `execute_sql` (hundreds of thousands of characters).
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `object_name` | — | Name as `OBJECT_ID()` takes it, e.g. `dbo.MyProc` |
+| `path` | — | Target `.sql` file inside the export root; a relative path is taken from the root |
+| `overwrite` | `false` | Replace the file if it already exists (refused otherwise, so an edited copy is not clobbered) |
+
+The file is UTF-8 without a BOM, written with `newline=''`: CRLF/LF and trailing whitespace are kept
+as stored, nothing is truncated. Before writing, the SHA2_256 of the UTF-16LE text is checked against
+`HASHBYTES('SHA2_256', definition)` computed on the server, and the file is read back and checked
+again. The reply carries only the path, the length in characters (`DATALENGTH(definition)/2`), the
+line count with CRLF/LF counts, and that hash.
+
+### `compare_module`
+
+Checks whether a `.sql` file equals a module's current definition — e.g. "has this script been run
+yet?", or DEV vs UAT by calling it on both servers. A file run as a single batch (no `GO`) is stored
+verbatim, header comments included, so after it runs the two match exactly.
+
+On a mismatch it reports the first differing line (length and first 8 hex chars of the line hash on
+each side — comparable with `STRING_SPLIT(definition, CHAR(10), 1)` — plus the kind of difference and a
+short excerpt around it), whether the two are identical apart from trailing whitespace and line
+endings, and the changed line ranges. UTF-8, UTF-8 with BOM and UTF-16 files are accepted.
+
+Both tools only accept paths inside the export root (`MSSQL_EXPORT_ROOT`); anything else — including
+`..` and symlinks that lead out of it — is refused before connecting. They run one fixed `SELECT`
+and roll back like every other tool.
 
 ## Installation
 
@@ -36,6 +111,24 @@ MSSQL_DATABASE=your_database
 TrustServerCertificate=yes
 Trusted_Connection=no
 ```
+
+Azure AD (`az login`) authentication instead of SQL auth:
+
+```bash
+MSSQL_AUTHENTICATION=azure   # drops MSSQL_USER / MSSQL_PASSWORD, uses the current az session
+```
+
+Optional flags:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `MSSQL_READONLY` | `true` | Set to `false` to lift the `execute_sql` read-only guard (the connection is still never committed) |
+| `MSSQL_EXPLAIN_ALLOW_EXEC` | `true` | Allow `EXEC`/DML in `explain_query` `mode='estimated'` (safe — SHOWPLAN does not execute) |
+| `MSSQL_EXPLAIN_ALLOW_ACTUAL_EXEC` | `false` | Allow `EXEC`/DML in `mode='actual'`, which really runs the statement before rolling back |
+| `MSSQL_PLAN_DIR` | `<tmp>/mssql_mcp_plans` | Where `.sqlplan` files are written |
+| `MSSQL_PLAN_INLINE_CHARS` | `200000` | Cap on inlined plan XML when `include_xml: true` |
+| `MSSQL_EXPORT_ROOT` | `~/work/.claude/plans/sql` | The only directory `export_module` / `compare_module` may write or read |
+| `MSSQL_ODBC_POOLING` | `true` | Set to `false` to disable ODBC connection pooling (slower, but removes any chance of a `SET` option surviving into the next call) |
 
 ## Usage
 
